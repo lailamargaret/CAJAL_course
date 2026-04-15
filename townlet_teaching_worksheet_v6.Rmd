@@ -1,3 +1,18 @@
+---
+title: "Townlet Teaching Worksheet: Modeling Compositional Donor Dynamics in a Cell Village"
+author: ""
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    theme: cosmo
+    df_print: paged
+    self_contained: true
+---
+
+```{r setup, include=FALSE}
 knitr::opts_chunk$set(
   echo = TRUE,
   warning = FALSE,
@@ -25,4 +40,1811 @@ reorder_palette_for_separation <- function(cols, n_chunks = 5) {
   cols_ord <- cols[ord]
   chunks <- split(cols_ord, cut(seq_along(cols_ord), breaks = n_chunks, labels = FALSE))
   max_len <- max(lengths(chunks))
-:
+  out <- unlist(
+    lapply(seq_len(max_len), function(i) {
+      vapply(chunks, function(x) if (length(x) >= i) x[i] else NA_character_, character(1))
+    }),
+    use.names = FALSE
+  )
+  out[!is.na(out)]
+}
+```
+
+------------------------------------------------------------------------
+
+# Welcome
+
+## What this worksheet is for
+
+This worksheet is a guided walkthrough of **Townlet** — not a recipe to run it, but a framework for understanding what it does and why.
+
+We start with raw census-seq data from a cell village experiment, explore what makes the data unusual, build up the intuition for why those features demand a specific kind of model, run Townlet, and then interpret what comes out. Every section connects the biology, the data structure, and the statistics together.
+
+The experiment you are working with treated a 38-donor NPC village with 0, 3, and 10 µM lead (Pb²⁺) and measured donor proportions by census-seq at day 0, 6, and 9. The goal is to identify donors that are resistant or sensitive to lead relative to a baseline donor.
+
+## Learning goals
+
+By the end of this worksheet, you should be able to:
+
+1.  Describe the structure of a Townlet-ready dataset and explain what one row represents.
+2.  Explain what makes village data **compositional** and why that matters for analysis.
+3.  Articulate why naive growth rate calculations are inappropriate and what they get wrong.
+4.  Describe the Dirichlet distribution and what it is designed to model.
+5.  Explain what Bayesian statistical modeling is and what a posterior distribution represents.
+6.  Run a complete Townlet analysis and understand what each step does.
+7.  Understand what **posterior draws** are and how to work with them.
+8.  Interpret `tau_d` (the donor-level treatment effect) and `beta` (the baseline proliferation effect) and their posterior uncertainty.
+9.  Distinguish between a donor's baseline proliferation rate and its lead sensitivity.
+10. Explain what the **local false sign rate (LFSR)** measures and how to use it.
+11. Connect model outputs back to the raw data to build a coherent biological story.
+
+## Files needed
+
+-   `pb_townlet_data.csv`
+
+-   
+
+    ## `donors to exclude.txt`
+
+# Load packages
+
+```{r libraries}
+# Uncomment to install Townlet if not yet installed
+# devtools::install_local("/path/to/townlet", upgrade = "never", force = TRUE)
+
+library(townlet)
+library(tidyverse)
+library(rstan)
+library(scales)
+library(ggrepel)
+```
+
+------------------------------------------------------------------------
+
+# Part 1: Meet the raw data
+
+## Read in and inspect the raw data
+
+```{r read-data, cache=TRUE}
+exclude <- read_lines("donors to exclude.txt")
+pb_raw <- read_csv("pb_townlet_data.csv")
+```
+
+```{r raw-glimpse}
+glimpse(pb_raw)
+```
+
+```{r raw-head}
+pb_raw %>% head(10)
+```
+
+Before we rename anything, take a moment to orient yourself: what is one row? Which column is the outcome variable? Which columns define the experimental structure?
+
+## Basic counts
+
+```{r donor-sample-counts}
+pb_raw %>%
+  summarize(
+    n_rows       = n(),
+    n_donors     = n_distinct(donor),
+    n_wells      = n_distinct(well),
+    n_timepoints = n_distinct(harvestday),
+    n_treatments = n_distinct(um_pb2)
+  )
+```
+
+## Rename columns for clarity
+
+We rename the key variables to reflect their modeling roles, but we do **not** filter out any donors yet — we want to first confirm the unit-sum property on the complete dataset before seeing what exclusion does to it.
+
+```{r rename-only}
+pb_all <- pb_raw %>%
+  rename(
+    representation  = proportion,
+    time            = harvestday,
+    replicate       = well,
+    treatment_lead  = um_pb2
+  )
+```
+
+------------------------------------------------------------------------
+
+# Part 2: The compositional structure of village data
+
+## What makes these data different?
+
+Census-seq does not measure absolute cell counts. It measures each donor's **share of the village** — the fraction of reads mapped to that donor at a given time and condition. That fraction is called **representation**.
+
+This is compositional data: a set of non-negative values that must sum to 1 within each sample. And that single constraint changes almost everything about how you should analyze it.
+
+### The unit-sum constraint — confirmed on the full dataset
+
+```{r sample-sums-before}
+sample_sums_before <- pb_all %>%
+  group_by(replicate, time, treatment_lead) %>%
+  summarize(total_representation = sum(representation), .groups = "drop")
+
+ggplot(sample_sums_before, aes(x = total_representation)) +
+  geom_histogram(bins = 30, fill = "grey80", color = "black") +
+  geom_vline(xintercept = 1, linetype = "dashed", color = "firebrick") +
+  theme_classic(base_size = 14) +
+  labs(
+    title = "All donor representations sum to ~1 within each sample (full dataset)",
+    x = "Sum of donor representations within a sample",
+    y = "Count"
+  )
+```
+
+Good — the totals cluster tightly near 1. This confirms the unit-sum property: these are compositional data where each sample is a complete description of the village.
+
+### What happens when we exclude donors?
+
+Four donors are excluded from the analysis. From the Townlet paper, these donors were removed for low initial representation or relatedness to other donors — both of which can compromise the model or violate its assumptions. But removing a donor from a composition breaks the unit-sum property: the remaining donors no longer add up to 1.
+
+```{r exclude-donors, cache=TRUE}
+pb_data <- pb_all %>%
+  filter(!donor %in% exclude)
+```
+
+```{r sample-sums-compare}
+sample_sums_after <- pb_data %>%
+  group_by(replicate, time, treatment_lead) %>%
+  summarize(total_representation = sum(representation), .groups = "drop")
+
+bind_rows(
+  sample_sums_before %>% mutate(dataset = "All donors (before exclusion)"),
+  sample_sums_after  %>% mutate(dataset = "Excluded donors removed (before renormalization)")
+) %>%
+  ggplot(aes(x = total_representation)) +
+  geom_histogram(bins = 30, fill = "grey80", color = "black") +
+  geom_vline(xintercept = 1, linetype = "dashed", color = "firebrick") +
+  facet_wrap(~dataset, ncol = 1) +
+  theme_classic(base_size = 13) +
+  labs(
+    title = "Removing donors breaks the unit-sum constraint",
+    subtitle = "This is why normalize = TRUE is required when donors are excluded",
+    x = "Sum of donor representations within a sample",
+    y = "Count"
+  )
+```
+
+The sums after exclusion are consistently less than 1 — the missing donors were real parts of the composition. This is why `normalize = TRUE` must be set when calling `init_village()`: it renormalizes the remaining donor proportions so they sum back to 1 before modeling begins.
+
+```{r add-sample-id}
+pb_data <- pb_data %>%
+  mutate(sample_id = interaction(replicate, time, treatment_lead, drop = TRUE, sep = "__"))
+```
+
+```{r filtering-summary}
+tibble(
+  dataset   = c("Full dataset", "After donor exclusion"),
+  n_rows    = c(nrow(pb_all),  nrow(pb_data)),
+  n_donors  = c(n_distinct(pb_all$donor), n_distinct(pb_data$donor))
+)
+```
+
+## Compositional structure: stacked bar charts
+
+The stacked bar chart is the most direct way to see compositional structure. Each bar is one sample; each color is one donor; the bar always fills to 1.
+
+```{r donor-colors-setup, cache=TRUE}
+# Build a consistent color palette keyed to donors
+donor_order <- pb_data %>%
+  group_by(donor) %>%
+  summarize(mean_representation = mean(representation), .groups = "drop") %>%
+  arrange(desc(mean_representation)) %>%
+  pull(donor)
+
+palette_spread <- reorder_palette_for_separation(base_donor_palette, n_chunks = 5)
+
+donor_colors <- setNames(
+  palette_spread[seq_along(donor_order)],
+  donor_order
+)
+```
+
+```{r stacked-bars-setup, cache=TRUE}
+# Renormalize after exclusion and set factor levels for plotting
+pb_data_closed <- pb_data %>%
+  group_by(replicate, time, treatment_lead) %>%
+  mutate(representation_closed = representation / sum(representation)) %>%
+  ungroup() %>%
+  mutate(
+    donor          = factor(donor, levels = rev(donor_order)),
+    replicate      = factor(replicate),
+    time           = factor(time, levels = sort(unique(time))),
+    treatment_lead = factor(treatment_lead, levels = sort(unique(treatment_lead)))
+  )
+
+# Subset to plotting timepoints: T0 baseline only, then treatment timepoints
+pb_plot <- pb_data_closed %>%
+  filter(
+    (time == 0 & replicate == 0) |
+    (time %in% c(6, 9) & replicate != 0)
+  ) %>%
+  mutate(
+    time = factor(time, levels = c(0, 6, 9), labels = c("Day 0", "Day 6", "Day 9")),
+    treatment_lead = factor(
+      treatment_lead,
+      levels = c(0, 3, 10),
+      labels = c("0 µM Pb²⁺", "3 µM Pb²⁺", "10 µM Pb²⁺")
+    )
+  )
+```
+
+```{r stacked-bars-all, fig.height=7}
+ggplot(pb_plot, aes(x = replicate, y = representation_closed, fill = donor)) +
+  geom_col(width = 0.82, color = "white", linewidth = 0.12) +
+  facet_grid(
+    treatment_lead ~ time,
+    switch = "y", scales = "free_x", space = "free_x"
+  ) +
+  scale_fill_manual(values = donor_colors, drop = FALSE) +
+  scale_y_continuous(expand = c(0, 0), breaks = c(0, 0.25, 0.5, 0.75, 1)) +
+  labs(
+    title    = "Donor composition across replicates, timepoints, and treatments",
+    subtitle = "T=0 shows the shared baseline replicate; later timepoints are treatment-specific",
+    x = "Replicate",
+    y = "Closed representation",
+    fill = "Donor"
+  ) +
+  theme_classic(base_size = 12) +
+  theme(
+    panel.spacing.x  = unit(1.2, "lines"),
+    panel.spacing.y  = unit(0.9, "lines"),
+    strip.background = element_rect(fill = "grey95", color = "black", linewidth = 0.6),
+    strip.placement  = "outside",
+    strip.text       = element_text(face = "bold"),
+    legend.position  = "none",
+    panel.border     = element_rect(color = "black", fill = NA, linewidth = 0.6)
+  )
+```
+
+Look at the bars. The total height never changes — it is always 1. But the slices shift. A color that grows forces other colors to shrink. No slice can be read in isolation.
+
+## Mean composition over time
+
+```{r mean-composition}
+mean_comp <- pb_data %>%
+  group_by(donor, time, treatment_lead) %>%
+  summarize(mean_representation = mean(representation), .groups = "drop")
+
+# Expand T0 into all three treatment panels
+baseline_mean <- mean_comp %>% filter(time == 0) %>% select(-treatment_lead)
+post_mean     <- mean_comp %>% filter(time != 0)
+
+mean_comp_plot <- bind_rows(
+  post_mean %>%
+    distinct(treatment_lead) %>%
+    tidyr::crossing(baseline_mean),
+  post_mean
+) %>%
+  mutate(
+    donor = factor(donor, levels = names(donor_colors)),
+    treatment_lead = factor(
+      treatment_lead,
+      levels = c(0, 3, 10),
+      labels = c("0 µM Pb²⁺", "3 µM Pb²⁺", "10 µM Pb²⁺")
+    )
+  )
+
+mean_comp_plot <- bind_rows(
+  post_mean %>%
+    distinct(treatment_lead) %>%
+    tidyr::crossing(baseline_mean),
+  post_mean
+) %>%
+  # Renormalize within each treatment x time group so bars sum to 1
+  group_by(treatment_lead, time) %>%
+  mutate(mean_representation = mean_representation / sum(mean_representation)) %>%
+  ungroup() %>%
+  mutate(
+    donor = factor(donor, levels = names(donor_colors)),
+    treatment_lead = factor(
+      treatment_lead,
+      levels = c(0, 3, 10),
+      labels = c("0 µM Pb²⁺", "3 µM Pb²⁺", "10 µM Pb²⁺")
+    )
+  )
+
+mean_comp_plot %>%
+  ggplot(aes(x = factor(time), y = mean_representation, fill = donor)) +
+  geom_col(position = "stack", color = "grey20", linewidth = 0.2) +
+  scale_fill_manual(values = donor_colors, drop = FALSE) +
+  scale_y_continuous(expand = c(0, 0)) +
+  facet_wrap(~treatment_lead, scales = "free_x") +
+  theme_classic(base_size = 14) +
+  theme(legend.position = "none") +
+  labs(
+    title = "Average village composition over time, by treatment",
+    x = "Day",
+    y = "Mean donor representation"
+  )
+```
+
+Even in the average view, the bars always fill to 1. The composition shifts over time and across lead concentrations — but it is not obvious yet which shifts are biologically meaningful versus noise.
+
+## The rank-abundance distribution
+
+```{r rank-abundance}
+pb_data %>%
+  group_by(donor) %>%
+  summarize(mean_representation = mean(representation), .groups = "drop") %>%
+  arrange(desc(mean_representation)) %>%
+  mutate(
+    rank  = row_number(),
+    donor = factor(donor, levels = donor)
+  ) %>%
+  ggplot(aes(x = donor, y = mean_representation, color = donor)) +
+  geom_line(aes(group = 1), color = "grey50", linewidth = 0.5) +
+  geom_point(size = 2.5) +
+  scale_color_manual(values = donor_colors, drop = FALSE) +
+  theme_classic(base_size = 12) +
+  theme(
+    axis.text.x    = element_text(angle = 45, hjust = 1),
+    legend.position = "none"
+  ) +
+  labs(
+    title = "Rank-abundance of donors (averaged across all conditions)",
+    x     = "Donor",
+    y     = "Mean representation"
+  )
+```
+
+Donors are not equal. Some consistently occupy a large fraction of the village; others are consistently rare. A rare donor's representation can fluctuate substantially in absolute terms from noise alone, while a dominant donor's changes are more reliably interpretable. Townlet accounts for this through the hierarchical structure of the model.
+
+## Heatmap of donor representation across samples
+
+```{r heatmap-representation, fig.height=8}
+# Build a cleaner sample label and explicit ordering
+heatmap_data <- pb_data %>%
+  mutate(
+    treatment_label = factor(
+      treatment_lead,
+      levels = c(0, 3, 10),
+      labels = c("0 µM", "3 µM", "10 µM")
+    ),
+    sample_label = paste0("Rep ", replicate),
+    donor = factor(donor, levels = rev(names(donor_colors)))  # most abundant at top
+  )
+
+ggplot(heatmap_data, aes(x = sample_label, y = donor, fill = representation)) +
+  geom_tile(color = "white", linewidth = 0.15) +
+  facet_grid(. ~ treatment_label + factor(time), scales = "free_x", space = "free_x",
+             labeller = labeller(
+               `factor(time)` = function(x) paste0("Day ", x)
+             )) +
+  scale_fill_viridis_c(option = "plasma", name = "Representation") +
+  theme_classic(base_size = 11) +
+  theme(
+    axis.text.x      = element_text(angle = 45, hjust = 1, size = 8),
+    axis.text.y      = element_text(size = 8),
+    strip.background = element_rect(fill = "grey95", color = "black", linewidth = 0.5),
+    strip.text       = element_text(face = "bold", size = 9),
+    panel.spacing    = unit(0.4, "lines")
+  ) +
+  labs(
+    title = "Donor representation across all samples",
+    x     = NULL,
+    y     = "Donor"
+  )
+```
+
+This heatmap shows the full data matrix. Rows are donors, columns are samples. Most donors are sparse (dark), a few are abundant, and the structure varies across the experimental grid. This is the object Townlet models.
+
+------------------------------------------------------------------------
+
+# Part 3: Raw trajectories and first-pass summaries
+
+## Trajectories for a subset of donors
+
+To look at how representation changes over time, we need to be a little careful: the baseline measurement (T=0) was taken before treatment was applied, so it is shared across all treatment conditions. We duplicate it into each treatment panel for plotting continuity.
+
+```{r build-trajectory-data, cache=TRUE}
+# T=0 rows are shared across all treatments — expand them into each panel
+baseline_rows <- pb_data %>% filter(time == 0) %>% select(-treatment_lead, -replicate)
+post_rows     <- pb_data %>% filter(time != 0)
+
+baseline_expanded <- post_rows %>%
+  distinct(treatment_lead, replicate) %>%
+  tidyr::crossing(baseline_rows)
+
+pb_plot_traj <- bind_rows(baseline_expanded, post_rows)
+
+# Mean profiles with SE for plotting
+pb_summary <- pb_data %>%
+  group_by(donor, time, treatment_lead) %>%
+  summarize(
+    mean_representation = mean(representation, na.rm = TRUE),
+    sd_representation   = sd(representation, na.rm = TRUE),
+    n  = n(),
+    se = sd_representation / sqrt(n),
+    .groups = "drop"
+  )
+
+baseline_summary_for_plot <- pb_summary %>% filter(time == 0) %>% select(-treatment_lead)
+post_summary_for_plot     <- pb_summary %>% filter(time != 0)
+
+pb_summary_plot <- bind_rows(
+  post_summary_for_plot %>%
+    distinct(treatment_lead) %>%
+    tidyr::crossing(baseline_summary_for_plot),
+  post_summary_for_plot
+)
+```
+
+```{r subset-trajectories}
+sensitive_donors <- c("UM14-1", "Genea42", "Genea47")
+resistant_donors <- c("WA09", "ESI049", "UCSF4")
+featured_donors  <- c(sensitive_donors, resistant_donors)
+
+
+pb_plot_traj %>%
+  filter(donor %in% featured_donors) %>%
+  mutate(
+    donor = factor(donor, levels = featured_donors),
+    treatment_lead = factor(
+      treatment_lead,
+      levels = c(0, 3, 10),
+      labels = c("0 µM Pb²⁺", "3 µM Pb²⁺", "10 µM Pb²⁺")
+    )
+  ) %>%
+  ggplot(aes(
+    x     = time,
+    y     = representation,
+    color = donor,
+    group = interaction(donor, replicate)
+  )) +
+  geom_line(alpha = 0.5, linewidth = 0.6) +
+  geom_point(size = 1.8) +
+  facet_wrap(~treatment_lead) +
+  scale_color_manual(values = donor_colors, drop = FALSE) +
+  scale_x_continuous(breaks = c(0, 6, 9)) +
+  theme_classic(base_size = 13) +
+  theme(legend.position = "right") +
+  labs(
+    title    = "Trajectories for six selected donors",
+    subtitle = "Lead-sensitive (UM14-1, Genea42, Genea47) vs lead-resistant (WA09, ESI049, UCSF4)",
+    x        = "Day",
+    y        = "Representation",
+    color    = "Donor"
+  )
+```
+
+## Mean donor profiles
+
+```{r mean-profiles}
+pb_summary_plot %>%
+  filter(donor %in% featured_donors) %>%
+  mutate(
+    donor = factor(donor, levels = featured_donors),
+    treatment_lead = factor(
+      treatment_lead,
+      levels = c(0, 3, 10),
+      labels = c("0 µM Pb²⁺", "3 µM Pb²⁺", "10 µM Pb²⁺")
+    )
+  ) %>%
+  ggplot(aes(x = time, y = mean_representation, color = donor, group = donor)) +
+  geom_line(linewidth = 0.8) +
+  geom_point(size = 2) +
+  geom_errorbar(aes(ymin = mean_representation - se, ymax = mean_representation + se), width = 0.4) +
+  facet_wrap(~treatment_lead) +
+  scale_color_manual(values = donor_colors, drop = FALSE) +
+  scale_x_continuous(breaks = c(0, 6, 9)) +
+  theme_classic(base_size = 13) +
+  theme(legend.position = "right") +
+  labs(
+    title    = "Mean representation over time for six selected donors",
+    subtitle = "Lead-sensitive (UM14-1, Genea42, Genea47) vs lead-resistant (WA09, ESI049, UCSF4) | Error bars ±1 SE",
+    x        = "Day",
+    y        = "Mean representation",
+    color    = "Donor"
+  )
+```
+
+------------------------------------------------------------------------
+
+# Part 4: Why naive growth summaries are insufficient
+
+## A reasonable first attempt
+
+The most obvious way to measure a donor's response to treatment is to compute how much its representation changed from the start to the end of the experiment. A log-ratio is a natural choice:
+
+$$
+\text{naive log growth} = \log_2\!\left(\frac{\text{final representation} + \varepsilon}{\text{initial representation} + \varepsilon}\right)
+$$
+
+where $\varepsilon$ is a small pseudocount to avoid dividing by zero.
+
+Let us compute this:
+
+```{r naive-growth, cache=TRUE}
+time_range <- pb_data %>%
+  summarize(first_time = min(time), last_time = max(time))
+
+eps <- 1e-6
+
+baseline_naive <- pb_data %>%
+  filter(time == time_range$first_time) %>%
+  group_by(donor) %>%
+  summarize(mean_representation_initial = mean(representation, na.rm = TRUE), .groups = "drop")
+
+final_naive <- pb_data %>%
+  filter(time == time_range$last_time) %>%
+  group_by(donor, treatment_lead) %>%
+  summarize(mean_representation_final = mean(representation, na.rm = TRUE), .groups = "drop")
+
+naive_growth <- final_naive %>%
+  left_join(baseline_naive, by = "donor") %>%
+  mutate(
+    naive_log2_growth = log2((mean_representation_final + eps) / (mean_representation_initial + eps))
+  )
+
+donor_order_naive <- naive_growth %>%
+  group_by(donor) %>%
+  summarize(mean_growth = mean(naive_log2_growth, na.rm = TRUE), .groups = "drop") %>%
+  arrange(mean_growth) %>%
+  pull(donor)
+
+naive_growth <- naive_growth %>%
+  mutate(
+    donor = factor(donor, levels = donor_order_naive),
+    treatment_label = factor(
+      treatment_lead,
+      levels = c(0, 3, 10),
+      labels = c("0 µM Pb²⁺", "3 µM Pb²⁺", "10 µM Pb²⁺")
+    )
+  )
+```
+
+```{r naive-growth-lollipop}
+# Order donors by their naive log2 change at the highest lead dose
+donor_order_naive <- naive_growth %>%
+  filter(treatment_lead == 10) %>%
+  arrange(naive_log2_growth) %>%
+  pull(donor) %>%
+  as.character()
+
+naive_growth %>%
+  mutate(
+    donor = factor(as.character(donor), levels = donor_order_naive),
+    treatment_label = factor(
+      treatment_lead,
+      levels = c(0, 3, 10),
+      labels = c("0 µM Pb²⁺", "3 µM Pb²⁺", "10 µM Pb²⁺")
+    ),
+    direction = ifelse(naive_log2_growth > 0, "Increased", "Decreased")
+  ) %>%
+  ggplot(aes(x = naive_log2_growth, y = donor, color = direction)) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey50") +
+  geom_point(size = 2.5) +
+  geom_segment(aes(x = 0, xend = naive_log2_growth, y = donor, yend = donor),
+               linewidth = 0.4, alpha = 0.6) +
+  scale_color_manual(values = c("Increased" = "#B2182B", "Decreased" = "#2166AC"),
+                     name = "") +
+  facet_wrap(~treatment_label, ncol = 3) +
+  theme_classic(base_size = 12) +
+  theme(
+    axis.text.y     = element_text(size = 7),
+    legend.position = "top",
+    panel.spacing   = unit(1, "lines")
+  ) +
+  labs(
+    title    = "Naive donor change from baseline to final timepoint",
+    subtitle = "Donors ordered by 10 µM effect size | Segments show direction and magnitude",
+    x        = "Naive log2 change (final / initial)",
+    y        = "Donor"
+  )
+```
+
+## Why this is still not enough
+
+The centered naive log-ratio is a useful descriptive starting point, but it has a set of structural problems:
+
+**1. It uses only two timepoints.** All the intermediate information about trajectory shape is thrown away. A donor that starts low, rises, then crashes looks the same as one that steadily declines.
+
+**2. It conflates treatment with growth.** All samples in a treatment condition were growing from day 0 to day 9, not just the lead-treated ones. There is no way to separate lead sensitivity from baseline growth rate using a single ratio.
+
+**3. It quantifies change but not uncertainty.** The naive log-ratio has no standard error attached to it. Two donors with the same point estimate but vastly different across-replicate variance are treated identically.
+
+**4. It inherits compositional distortion.** The unit-sum constraint means that a donor can appear to decline simply because other donors proliferated. The naive ratio captures this mixed signal without decomposing it.
+
+**5. It cannot separate donor effects from global shifts.** If all donors grow under lead (perhaps because the village is healthy at the concentrations used), a donor that grows slightly less than average will show a negative naive log-ratio even though it is not particularly sensitive.
+
+Townlet addresses all five problems simultaneously. The model integrates all timepoints, includes a separate baseline condition term, produces a full posterior distribution over each donor's effect, models donors jointly so that global compositional shifts are accounted for, and uses a hierarchical structure so that noisy donors borrow strength from the group.
+
+------------------------------------------------------------------------
+
+> **Statistical vocabulary for Parts 5–9**
+>
+> The next sections introduce modeling concepts that use a few technical terms precisely. Here is a short reference you can return to at any point.
+>
+> -   **Parameter** — a quantity the model *estimates* from data, rather than measuring directly. In Townlet the parameters include `tau_d` (each donor's lead effect), `beta` (each donor's baseline growth rate), and `kappa` (a dispersion term). You will never see these values in your CSV; the model infers them from the proportions you do observe.
+>
+> -   **Vector** — an ordered list of numbers treated as a unit. The composition of the village at one timepoint is a vector of 35 donor proportions. The concentration parameters of the Dirichlet distribution (introduced below) are also a vector — one entry per donor.
+>
+> -   **Latent effect** — a quantity that exists but cannot be directly measured; it must be inferred from the data. Each donor's true sensitivity to lead is latent: we never observe it directly, only the noisy proportions it produces across replicates and timepoints. "Latent" is a general statistics term for "hidden." You will see it used again in Part 7 when we describe `tau_d` as a donor-level latent effect.
+>
+> -   **Prior distribution** — what the model assumes about a parameter *before* seeing any data. In a hierarchical model, the prior for each donor's effect is partly informed by the other donors — this is what "borrowing strength" means. Priors are introduced formally in Part 6.
+>
+> -   **Likelihood** — how well a given set of parameter values explains the observed data. The model finds parameter values that balance a high likelihood (fitting the data well) with consistency with the prior. Also introduced in Part 6.
+
+------------------------------------------------------------------------
+
+# Part 5: Understanding compositional data and the Dirichlet distribution
+
+## The geometry of compositional data
+
+> **What is a simplex?**
+>
+> When you have $D$ proportions that must sum to 1, the data live on a mathematical object called a **simplex**. For two proportions, the simplex is a line segment from $(0,1)$ to $(1,0)$. For three proportions, it is an equilateral triangle. For $D$ proportions, it is a $(D-1)$-dimensional surface embedded in $D$-dimensional space.
+>
+> The simplex is not Euclidean. Distances and directions on it do not behave like distances and directions in ordinary space. For example, you cannot add two compositions and expect the result to mean anything — a proportion of 0.4 plus a proportion of 0.4 does not give 0.8 in any interpretable compositional sense unless all other proportions adjust accordingly.
+>
+> Standard linear regression assumes data live in Euclidean space. Applied to proportions, it ignores the simplex geometry, which produces correlations and regression coefficients that can be artifacts of the unit-sum constraint rather than signals.
+
+## The Dirichlet distribution
+
+The Dirichlet distribution is the natural probability distribution for vectors of positive values that sum to 1. It is parameterized by a vector of concentration parameters $\boldsymbol{\alpha} = (\alpha_1, \ldots, \alpha_D)$, where $D$ is the number of categories (donors, in our case).
+
+Intuition for what $\boldsymbol{\alpha}$ controls:
+
+-   If all $\alpha_k = 1$: the distribution is **uniform** over the simplex — any composition is equally likely.
+-   If all $\alpha_k \ll 1$: the distribution is **sparse** — compositions tend to concentrate all mass on one or a few categories.
+-   If all $\alpha_k \gg 1$: the distribution is **concentrated** — compositions tend to be nearly equal across all categories.
+-   If some $\alpha_k$ are much larger than others: the distribution favors compositions where those categories dominate.
+
+Let us visualize this intuition for a 2 donor village, where we can plot the full simplex. Below is the code to run a quick simulation in 2 dimensional space.
+
+```{r dirichlet-intuition, cache=TRUE, fig.width=12, fig.height=4}
+# Simulate draws from 2D Dirichlet (plotted as 2-component proportions on a line)
+# to build intuition about concentration parameters
+
+set.seed(7)
+
+sim_dirichlet_2d <- function(alpha, n = 5000) {
+  x <- rgamma(n * 2, shape = rep(alpha, each = n), rate = 1)
+  x_mat <- matrix(x, ncol = 2)
+  x_mat / rowSums(x_mat)
+}
+
+params <- list(
+  "α = (0.2, 0.2)\nSparse: most mass on one donor" = c(0.2, 0.2),
+  "α = (1, 1)\nUniform: all compositions equally likely" = c(1, 1),
+  "α = (5, 5)\nConcentrated: near-equal split" = c(5, 5)
+)
+
+dirichlet_2d_df <- map_dfr(names(params), function(nm) {
+  draws <- sim_dirichlet_2d(params[[nm]])
+  tibble(p1 = draws[, 1], label = nm)
+})
+
+ggplot(dirichlet_2d_df, aes(x = p1)) +
+  geom_histogram(bins = 60, fill = "steelblue", color = "white", linewidth = 0.2) +
+  facet_wrap(~label, ncol = 3) +
+  theme_classic(base_size = 12) +
+  labs(
+    title    = "How concentration parameters shape the Dirichlet distribution (2-donor simplex)",
+    subtitle = "p1 = donor 1's share; donor 2's share = 1 − p1",
+    x = "Donor 1 representation", y = "Count"
+  )
+```
+
+Now extend that to three donors — you can no longer use a histogram, but you can project the 3-donor simplex onto a triangle. Each point is one sampled composition
+
+```{r dirichlet-intuition-3d, cache=TRUE, fig.width=12, fig.height=4}
+project_ternary <- function(mat) {
+  tibble(
+    x = 0.5 * (2 * mat[, 2] + mat[, 3]) / rowSums(mat),
+    y = (sqrt(3) / 2) * mat[, 3] / rowSums(mat)
+  )
+}
+
+sim_dir3 <- function(alpha, n = 2000) {
+  x <- matrix(rgamma(n * 3, shape = rep(alpha, each = n)), ncol = 3)
+  x / rowSums(x)
+}
+
+params3 <- list(
+  "α = (0.3, 0.3, 0.3)\nSparse" = c(0.3, 0.3, 0.3),
+  "α = (1, 1, 1)\nUniform"      = c(1, 1, 1),
+  "α = (8, 8, 8)\nConcentrated" = c(8, 8, 8)
+)
+ternary_df <- map_dfr(names(params3), function(nm) {
+  draws <- sim_dir3(params3[[nm]])
+  project_ternary(draws) %>% mutate(label = nm)
+})
+
+# Corner coordinates for a standard ternary plot
+corner_labels <- tibble(
+  x     = c(0.5,   0.02,  0.98),
+  y     = c(sqrt(3)/2 - 0.03,  0.03,  0.03),
+  donor = c("Donor 3", "Donor 1", "Donor 2"),
+  hjust = c(0.5,   0.0,   1.0),
+  vjust = c(1.0,   0.0,   0.0)
+)
+
+ggplot(ternary_df, aes(x = x, y = y)) +
+  geom_point(alpha = 0.15, size = 0.7, color = "steelblue") +
+  geom_text(
+    data        = corner_labels,
+    aes(x = x, y = y, label = donor, hjust = hjust, vjust = vjust),
+    inherit.aes = FALSE,
+    fontface    = "bold",
+    size        = 3.5
+  ) +
+  coord_fixed() +
+  facet_wrap(~label, ncol = 3) +
+  theme_void(base_size = 12) +
+  theme(
+    strip.text   = element_text(size = 10),
+    panel.border = element_rect(color = "grey60", fill = NA)
+  ) +
+  labs(
+    title    = "Dirichlet draws projected onto the 3-donor simplex (ternary plot)",
+    subtitle = "Each point is a sampled composition. A point near a corner means that donor dominates."
+  )
+```
+
+The vertices of the triangle represent a composition where a single donor has 100% representation. The center represents perfect equality. The concentration parameter controls how spread out versus how corner-hugging the compositions are.
+
+## Why the Dirichlet is the right tool for village data
+
+The Dirichlet distribution does three things that make it appropriate here:
+
+1.  It is defined on the simplex — outputs are non-negative and sum to 1 by construction.
+2.  It respects the **joint** structure of the composition: increasing one donor's expected share forces others down automatically.
+3.  It has a natural parameterization through log-linear models, so we can write down regression equations that link experimental covariates (time, treatment) to donor-specific expected shares.
+
+------------------------------------------------------------------------
+
+# Part 6: Bayesian inference and what a posterior distribution is
+
+## From data to beliefs
+
+> **Bayesian modeling in plain language**
+>
+> In classical (frequentist) statistics, you estimate a single best-fit number for each parameter and then ask: "Given this parameter value, how surprising are the data?" The result is a p-value and, often, a single point estimate with a standard error.
+>
+> In Bayesian statistics, you treat parameters as uncertain quantities and ask: "Given the data I observed, what do I believe about the parameter?" The answer is a **posterior distribution** — a full probability distribution over possible parameter values.
+>
+> The posterior combines two ingredients:
+>
+> -   The **likelihood**: how well a given parameter value explains the observed data.
+> -   The **prior**: what you believed about the parameter before seeing the data.
+>
+> Bayes' theorem says: `posterior ∝ likelihood × prior`
+>
+> After fitting, instead of one number you have a *distribution*. That distribution tells you not just the most likely value, but also how certain or uncertain you are, and what range of values is plausible given the data.
+
+## What are posterior draws?
+
+Stan (the probabilistic programming language Townlet uses under the hood) explores the posterior distribution using a technique called **Hamiltonian Monte Carlo (HMC)**. The result is a large collection of samples from the posterior — called **draws** or **samples**.
+
+Each draw is one plausible set of parameter values given the data. If you take 4000 draws, you have 4000 slightly different versions of the model's parameter estimates, each consistent with the data to varying degrees.
+
+**What you do with draws:**
+
+| Goal                            | How                                                         |
+|--------------------------|----------------------------------------------|
+| Point estimate (posterior mean) | Average the draws                                           |
+| Uncertainty interval            | Take quantiles (e.g., 2.5th–97.5th = 95% credible interval) |
+| Probability of positive effect  | Fraction of draws where the parameter \> 0                  |
+| Full distribution               | Plot a histogram or density of the draws                    |
+
+The power of draws is that you can compute any summary statistic you want without additional assumptions. The distribution is the answer.
+
+### Why sampling is necessary: visualizing HMC
+
+For a model with 35 donors and multiple global parameters, the posterior is a high-dimensional surface we cannot write down in closed form. HMC navigates it by treating the current parameter values like a particle on a physical landscape. At each step, the particle receives a random "kick" and then rolls along the gradient of the posterior surface — downhill toward less probable regions, up toward more probable ones — before the new position is recorded as a draw. This gradient-guided movement is far more efficient than random guessing in high dimensions.
+
+The two plots below build up this intuition for a simplified two-parameter case.
+
+```{r hmc-intuition, cache=TRUE, fig.width=14, fig.height=5}
+set.seed(12)
+n_hmc <- 2000
+
+# Simulate an autocorrelated chain via AR(1) to mimic HMC local moves
+rho_ar  <- 0.75
+mu_A    <-  0.30;  sd_A <- 0.20
+mu_B    <- -0.20;  sd_B <- 0.18
+
+chain_A <- numeric(n_hmc)
+chain_B <- numeric(n_hmc)
+chain_A[1] <- mu_A;  chain_B[1] <- mu_B
+
+for (i in seq(2, n_hmc)) {
+  chain_A[i] <- mu_A + rho_ar * (chain_A[i-1] - mu_A) + rnorm(1, 0, sd_A * sqrt(1 - rho_ar^2))
+  chain_B[i] <- mu_B + rho_ar * (chain_B[i-1] - mu_B) + rnorm(1, 0, sd_B * sqrt(1 - rho_ar^2))
+}
+
+hmc_df <- tibble(
+  tau_donor_A = chain_A,
+  tau_donor_B = chain_B,
+  draw_index  = seq_len(n_hmc)
+)
+
+# Find 20 consecutive draws that stay well inside the posterior mass
+window_sd <- sapply(seq(200, n_hmc - 20), function(i) {
+  w <- hmc_df %>% slice(i:(i + 19))
+  max(abs(w$tau_donor_A - mu_A) / sd_A, abs(w$tau_donor_B - mu_B) / sd_B)
+})
+best_start  <- which.min(window_sd) + 199
+trace_draws <- hmc_df %>% slice(best_start:(best_start + 19))
+
+# Shared axis limits so both panels are directly comparable
+xlim_shared <- c(mu_A - 3.5 * sd_A, mu_A + 3.5 * sd_A)
+ylim_shared <- c(mu_B - 3.5 * sd_B, mu_B + 3.5 * sd_B)
+
+# Panel 1 — the posterior landscape
+p_landscape <- ggplot(hmc_df, aes(x = tau_donor_A, y = tau_donor_B)) +
+  stat_density_2d(
+    aes(fill = after_stat(level)), geom = "polygon", bins = 10, alpha = 0.75
+  ) +
+  scale_fill_distiller(palette = "Blues", direction = 1, name = "Posterior\ndensity") +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey50") +
+  coord_cartesian(xlim = xlim_shared, ylim = ylim_shared) +
+  theme_classic(base_size = 13) +
+  labs(
+    title    = "Step 1: The posterior is a landscape",
+    subtitle = "Darker = more probable region for two simulated donor parameters",
+    x = "tau_d (Donor A)", y = "tau_d (Donor B)"
+  )
+
+# Panel 2 — draws scattered on that landscape, with a short trajectory
+p_draws <- ggplot(hmc_df, aes(x = tau_donor_A, y = tau_donor_B)) +
+  stat_density_2d(
+    aes(fill = after_stat(level)), geom = "polygon", bins = 10, alpha = 0.35
+  ) +
+  scale_fill_distiller(palette = "Blues", direction = 1, name = "Posterior\ndensity") +
+  geom_point(alpha = 0.07, size = 0.9, color = "black") +
+  geom_path(data = trace_draws, color = "firebrick", linewidth = 0.8, alpha = 0.9) +
+  geom_point(data = trace_draws, color = "firebrick", size = 2.0, alpha = 0.9) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey50") +
+  coord_cartesian(xlim = xlim_shared, ylim = ylim_shared) +
+  theme_classic(base_size = 13) +
+  labs(
+    title    = "Step 2: HMC collects draws from that landscape",
+    subtitle = "Grey = 2,000 draws | Red path = 20 consecutive draws (one chain fragment)",
+    x = "tau_d (Donor A)", y = "tau_d (Donor B)"
+  )
+
+gridExtra::grid.arrange(p_landscape, p_draws, ncol = 2)
+```
+
+The key insight: adjacent draws are correlated (you can see the red path moving smoothly rather than jumping randomly), but over thousands of steps the full collection of grey dots faithfully represents the posterior. The final collection is what you work with — not the trajectory itself. When Stan reports 4,000 draws, those are 4,000 positions this particle visited after the warmup phase was discarded.
+
+------------------------------------------------------------------------
+
+# Part 7: What Townlet models
+
+## High-level description
+
+Townlet fits a **hierarchical Dirichlet regression model** to the village composition data. At its core, it models the expected composition of the village as a function of time and treatment, with a separate latent effect estimated for each donor.
+
+The key parameters you will work with are:
+
+| Parameter | What it means                                                                  |
+|--------------|----------------------------------------------------------|
+| `tau_d`   | Donor-specific treatment effect (on the log scale, relative to baseline donor) |
+| `beta`    | Donor-specific baseline proliferation rate                                     |
+| `kappa`   | Dispersion parameter (how spread out compositions are across replicates)       |
+
+For this worksheet, we focus on `tau_d`: the estimated lead sensitivity of each donor, relative to the baseline donor (CHB11).
+
+A positive `tau_d` means the donor increased its village share under lead treatment — consistent with **lead resistance**. A negative `tau_d` means the donor lost village share under lead — consistent with **lead sensitivity**.
+
+## The baseline donor
+
+The model requires a reference point. One donor is designated as the baseline; all other donors' effects are estimated relative to it. This is similar to how a reference level works in a linear regression with categorical predictors — it is a parameterization choice, not a statement that the baseline donor is "neutral."
+
+In this analysis the baseline donor is **CHB11**.
+
+**How is the baseline donor chosen?** This is a practical decision guided by three criteria:
+
+1.  **Consistency across conditions.** A good baseline has low replicate-to-replicate variance — its representation is stable enough that other donors' effects can be cleanly estimated relative to it. A donor that fluctuates wildly from replicate to replicate injects noise into every other relative estimate.
+
+2.  **No strong prior expectation of treatment response.** If the baseline donor is itself strongly lead-sensitive or lead-resistant, all other donors' `tau_d` values are shifted accordingly. A "middling" donor — neither obviously sensitive nor resistant — makes the relative effects more interpretable.
+
+3.  **It is a parameterization choice, not a ground truth.** The baseline donor's own `tau_d` is fixed at zero by definition. If you re-ran Townlet with a different baseline, the *relative ranking* of all other donors would be preserved; only the reference point shifts. Think of it like choosing a reference category in linear regression.
+
+You can inspect donor-level consistency empirically by computing the coefficient of variation (CV = SD / mean) across all samples:
+
+```{r baseline-donor-cv, cache=TRUE}
+donor_cv <- pb_data %>%
+  group_by(donor) %>%
+  summarize(
+    mean_rep = mean(representation),
+    sd_rep   = sd(representation),
+    cv       = sd_rep / mean_rep,
+    .groups  = "drop"
+  ) %>%
+  arrange(cv)
+
+donor_cv %>%
+  mutate(is_baseline = donor == "CHB11") %>%
+  ggplot(aes(x = reorder(donor, cv), y = cv, color = is_baseline)) +
+  geom_point(size = 2.2) +
+  geom_hline(
+    yintercept = donor_cv %>% filter(donor == "CHB11") %>% pull(cv),
+    linetype = "dashed", color = "firebrick", linewidth = 0.8
+  ) +
+  scale_color_manual(
+    values = c(`FALSE` = "grey60", `TRUE` = "firebrick"),
+    labels = c(`FALSE` = "Other donors", `TRUE` = "CHB11 (baseline)"),
+    name   = ""
+  ) +
+  theme_classic(base_size = 13) +
+  theme(
+    axis.text.x     = element_text(angle = 45, hjust = 1, size = 8),
+    legend.position = "top"
+  ) +
+  labs(
+    title    = "Coefficient of variation in representation across all samples",
+    subtitle = "Lower CV = more consistent donor | CHB11 marked in red",
+    x = "Donor", y = "CV (SD / mean)"
+  )
+```
+
+A low CV positions CHB11 as a stable, consistent reference. Students sometimes ask: "What if the instructor had chosen a different baseline?" That is a reasonable question — try it by re-running `init_village()` with `baseline = "WA09"` (a resistant donor) and comparing the resulting `tau_d` rankings. The relative order of other donors should be preserved; only the scale shifts.
+
+# Part 8: Initialize and run Townlet
+
+## Save the renamed data and initialize
+
+```{r write-renamed}
+write_csv(pb_data, "pb_townlet_data_renamed.csv")
+```
+
+```{r init-village, cache=TRUE}
+village <- init_village(
+  "pb_townlet_data_renamed.csv",
+  outdir    = "townlet",
+  normalize = TRUE,
+  model     = "~treatment_lead",
+  baseline  = "CHB11"
+)
+```
+
+## Inspect the initialized object
+
+```{r inspect-village}
+names(village)
+str(village, max.level = 1)
+```
+
+The village object is a list. At this stage, before fitting, it already contains the data in a structured form, the model formula, metadata about donors and samples, and the input objects Stan needs. The `fit` slot is empty until `run_townlet()` is called.
+
+## Fit the model
+
+When this runs for the first time, Stan will compile the model (this takes a minute). Then sampling begins — you will see progress from 4 chains in parallel.
+
+```{r run-townlet, eval=FALSE}
+# Run this once to fit the model and save the result.
+# Set eval=TRUE to refit, then set back to eval=FALSE.
+village <- run_townlet(village)
+saveRDS(village, "village_fitted.rds")
+```
+
+```{r load-townlet}
+# This loads the previously fitted model for all downstream chunks.
+# If village_fitted.rds does not exist, run the chunk above first.
+if (!file.exists("village_fitted.rds")) {
+  stop("village_fitted.rds not found. Set eval=TRUE in the run-model chunk above and run it first.")
+}
+village <- readRDS("village_fitted.rds")
+```
+
+## What changed?
+
+```{r inspect-postfit}
+names(village)
+```
+
+After fitting, `village$fit` holds the full Stan posterior. The model also automatically extracts summary tables:
+
+```{r df-proliferation-preview}
+glimpse(village$df_proliferation)
+village$df_proliferation %>% head(10)
+```
+
+```{r df-lfsr-preview}
+glimpse(village$df_lfsr_treat)
+village$df_lfsr_treat %>% ungroup() %>% head(10)
+```
+
+`df_proliferation` contains point estimates of donor-level effects. `df_lfsr_treat` contains the local false sign rates for treatment effects. We will explore both in depth shortly.
+
+# Part 9: Posterior draws — baseline proliferation first
+
+## What we are extracting and why
+
+The fitted model contains thousands of posterior draws for every parameter. We start with `beta` — the simpler of the two donor-level parameters — because it only involves growth in the absence of treatment. Once that is clear, `tau_d` adds one more layer: how lead modifies that growth.
+
+Each draw is one complete, self-consistent set of parameter values sampled from the posterior. Looking at the collection of draws for a single parameter gives you its posterior distribution — the full range of plausible values given the data.
+
+## Extract `beta` draws
+
+```{r extract-beta, cache=TRUE}
+beta_draws <- rstan::extract(village$fit, pars = "beta")$beta
+dim(beta_draws)  # rows = posterior draws, columns = donors
+```
+
+The dimensions confirm: you have thousands of posterior draws, one value per donor per draw. Each row is one complete posterior sample from the model.
+
+## Convert to a tidy format
+
+```{r beta-to-tidy, cache=TRUE}
+beta_draws_df <- as.data.frame(beta_draws)
+colnames(beta_draws_df) <- village$df_proliferation$donor
+
+beta_long <- beta_draws_df %>%
+  mutate(draw = row_number()) %>%
+  pivot_longer(-draw, names_to = "donor", values_to = "beta")
+
+beta_long %>% head(10)
+```
+
+## The posterior for a single donor
+
+Pick the first donor and look at its entire posterior distribution for baseline proliferation.
+
+```{r one-donor-beta-posterior}
+one_donor <- village$df_proliferation$donor[[1]]
+
+beta_long %>%
+  filter(donor == one_donor) %>%
+  ggplot(aes(x = beta)) +
+  geom_histogram(bins = 50, color = "black", fill = "steelblue", alpha = 0.8) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "firebrick", linewidth = 1) +
+  theme_classic(base_size = 14) +
+  labs(
+    title    = paste("Posterior distribution of beta for donor:", one_donor),
+    subtitle = "Each bar represents a range of plausible baseline growth rates given the data",
+    x = "beta (baseline proliferation rate relative to CHB11)",
+    y = "Count of posterior draws"
+  )
+```
+
+This is the posterior distribution in action. The dashed line is zero — same growth rate as CHB11. The location of the histogram tells you the most likely effect; its width tells you how certain the model is. A wide histogram means the data did not pin down this donor's growth rate precisely. A narrow one means it did.
+
+## Summarize and plot baseline proliferation effects
+
+```{r beta-summary, cache=TRUE}
+beta_summary <- beta_long %>%
+  group_by(donor) %>%
+  summarize(
+    mean_beta = mean(beta),
+    lower95   = quantile(beta, 0.025),
+    upper95   = quantile(beta, 0.975),
+    .groups   = "drop"
+  ) %>%
+  arrange(mean_beta) %>%
+  mutate(donor = factor(donor, levels = donor))
+
+beta_long <- beta_long %>%
+  mutate(donor = factor(donor, levels = levels(beta_summary$donor)))
+```
+
+```{r beta-interval-plot, fig.height=6}
+beta_long %>%
+  mutate(donor = factor(donor, levels = levels(beta_summary$donor))) %>%
+  ggplot(aes(x = donor, y = beta, fill = donor)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  geom_violin(color = "black", width = 0.9, scale = "width") +
+  geom_linerange(
+    data = beta_summary,
+    aes(x = donor, ymin = lower95, ymax = upper95),
+    inherit.aes = FALSE, linewidth = 0.7, color = "black"
+  ) +
+  geom_point(
+    data = beta_summary,
+    aes(x = donor, y = mean_beta),
+    inherit.aes = FALSE,
+    shape = 19, size = 2.8, color = "black"
+  ) +
+  scale_fill_manual(values = donor_colors, drop = FALSE) +
+  theme_classic(base_size = 13) +
+  theme(
+    axis.text.x     = element_text(angle = 45, hjust = 1),
+    legend.position = "none"
+  ) +
+  labs(
+    title    = "Full posterior distributions of baseline proliferation effects (beta)",
+    subtitle = "Violin = posterior shape; line = 95% CI; dot = posterior mean | Ordered slowest to fastest grower",
+    x        = "Donor",
+    y        = "Baseline proliferation effect (beta)"
+  )
+```
+
+This is the village's growth hierarchy in control conditions, with full uncertainty. Donors on the right grow faster than CHB11 in the absence of lead; donors on the left grow slower. The width of each violin reflects how confidently the model estimated that donor's rate. Note that this ranking tells you nothing yet about lead sensitivity — that is a separate question answered by `tau_d`.
+
+------------------------------------------------------------------------
+
+# Part 10: Treatment effects — how lead changes donor growth
+
+## What `tau_d` represents
+
+Now that you can see how donors differ in baseline growth, we add the second layer: how does lead *change* each donor's trajectory? This is `tau_d` — the treatment slope per donor.
+
+`tau_d` is estimated on top of `beta`. It is the additional effect of lead concentration on a donor's representation, relative to CHB11. A donor with a positive `tau_d` gains village share as lead increases — consistent with lead resistance. A donor with a negative `tau_d` loses share — consistent with lead sensitivity.
+
+Crucially, `beta` and `tau_d` are estimated jointly but are independent. A fast baseline grower is not automatically resistant to lead, and a slow grower is not automatically sensitive. The model separates these two properties explicitly, which is one of the core advantages over naive summaries that conflate them.
+
+## Extract `tau_d` draws
+
+```{r extract-draws, cache=TRUE}
+tau_draws <- rstan::extract(village$fit, pars = "tau_d")$tau_d
+dim(tau_draws)  # rows = posterior draws, columns = donors
+```
+
+## Convert to a tidy format
+
+```{r draws-to-tidy, cache=TRUE}
+tau_draws_df <- as.data.frame(tau_draws)
+colnames(tau_draws_df) <- village$df_proliferation$donor
+
+tau_long <- tau_draws_df %>%
+  mutate(draw = row_number()) %>%
+  pivot_longer(-draw, names_to = "donor", values_to = "tau_d")
+
+tau_long %>% head(10)
+```
+
+## The posterior for a single donor
+
+```{r one-donor-posterior}
+tau_long %>%
+  filter(donor == one_donor) %>%
+  ggplot(aes(x = tau_d)) +
+  geom_histogram(bins = 50, color = "black", fill = "steelblue", alpha = 0.8) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "firebrick", linewidth = 1) +
+  theme_classic(base_size = 14) +
+  labs(
+    title    = paste("Posterior distribution of tau_d for donor:", one_donor),
+    subtitle = "Each bar represents a range of plausible lead effect sizes given the data",
+    x = "tau_d (lead effect, log scale relative to CHB11)",
+    y = "Count of posterior draws"
+  )
+```
+
+Compare this to the `beta` histogram you just looked at for the same donor. The location and width may differ substantially — a donor can be confidently estimated for baseline growth but uncertain for lead effect, or vice versa, depending on how much the treatment replicates constrained the estimate.
+
+## Posteriors for several donors at once
+
+```{r several-posteriors}
+tau_long %>%
+  filter(donor %in% featured_donors) %>%
+  mutate(
+    donor = factor(donor, levels = featured_donors),
+    donor_group = case_when(
+      donor %in% sensitive_donors ~ "Lead-sensitive: UM14-1, Genea42, Genea47",
+      donor %in% resistant_donors ~ "Lead-resistant: WA09, ESI049, UCSF4"
+    )
+  ) %>%
+  ggplot(aes(x = tau_d, fill = donor)) +
+  geom_density(alpha = 0.4, color = "grey40") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "black", linewidth = 0.8) +
+  scale_fill_manual(values = donor_colors, drop = FALSE) +
+  facet_wrap(~donor_group, ncol = 1) +
+  theme_classic(base_size = 14) +
+  labs(
+    title    = "Posterior tau_d distributions for six selected donors",
+    subtitle = "Sensitive donors cluster left of zero; resistant donors cluster right",
+    x        = "tau_d (lead effect relative to CHB11)",
+    y        = "Density",
+    fill     = "Donor"
+  )
+```
+
+-   A distribution centered well above zero → donor likely resistant to lead.
+-   A distribution centered well below zero → donor likely sensitive to lead.
+-   A wide distribution straddling zero → model is uncertain about this donor's direction.
+-   A narrow distribution well away from zero → model is confident about both direction and size of effect.
+
+Width and location together tell the full story.
+
+------------------------------------------------------------------------
+
+# Part 11: Summarize both parameters and compare
+
+## Build posterior summaries for `tau_d`
+
+> **Quick definition: LFSR (local false sign rate)**
+>
+> The code below joins `lfsr` values from `village$df_lfsr_treat` into the donor summary table. LFSR is the posterior probability that you have the *wrong directional conclusion* about a donor's effect — for example, calling a donor resistant when it is actually sensitive. LFSR \< 0.05 means the model is at least 95% confident it has the direction right.
+>
+> We use this immediately to color and shape the plots in this section. The full geometric explanation of how LFSR is computed from the posterior draws is in **Section 14**.
+
+```{r summarize-tau, cache=TRUE}
+tau_summary <- tau_long %>%
+  group_by(donor) %>%
+  summarize(
+    mean_tau = mean(tau_d),
+    lower95  = quantile(tau_d, 0.025),
+    upper95  = quantile(tau_d, 0.975),
+    .groups  = "drop"
+  ) %>%
+  left_join(
+    village$df_lfsr_treat %>% ungroup() %>% select(donor, lfsr),
+    by = "donor"
+  ) %>%
+  mutate(sig_vs_baseline = lfsr < 0.05) %>%
+  arrange(mean_tau) %>%
+  mutate(donor = factor(donor, levels = donor))
+
+tau_long <- tau_long %>%
+  mutate(donor = factor(donor, levels = levels(tau_summary$donor)))
+```
+
+## Credible interval plot
+
+```{r interval-plot, fig.height=6}
+ggplot(tau_summary, aes(x = donor, y = mean_tau)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  geom_linerange(aes(ymin = lower95, ymax = upper95), linewidth = 0.8) +
+  geom_point(
+    data = tau_summary %>% filter(!sig_vs_baseline),
+    aes(x = donor, y = mean_tau),
+    shape = 19, size = 2.8, color = "black"
+  ) +
+  geom_point(
+    data = tau_summary %>% filter(sig_vs_baseline),
+    aes(x = donor, y = mean_tau),
+    shape = 23, size = 2.8, stroke = 0.9, fill = "white", color = "black"
+  ) +
+  theme_classic(base_size = 14) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(
+    title = "Posterior mean and 95% credible interval for each donor's lead effect",
+    x = "Donor", y = "Estimated lead effect (tau_d)"
+  )
+```
+
+Donors are ordered from most sensitive (negative `tau_d`) to most resistant (positive `tau_d`). The vertical line at zero is the null. Donors whose intervals do not cross zero tend to have low LFSR.
+
+## Full posterior distributions (violin plot)
+
+```{r violin-plot, fig.height=6}
+ggplot(tau_long, aes(x = donor, y = tau_d, fill = donor)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  geom_violin(color = "black", width = 0.9, scale = "width") +
+  geom_linerange(
+    data = tau_summary,
+    aes(x = donor, ymin = lower95, ymax = upper95),
+    inherit.aes = FALSE, linewidth = 0.7, color = "black"
+  ) +
+  geom_point(
+    data = tau_summary %>% filter(!sig_vs_baseline),
+    aes(x = donor, y = mean_tau),
+    inherit.aes = FALSE,
+    shape = 19, size = 2.8, color = "black"
+  ) +
+  geom_point(
+    data = tau_summary %>% filter(sig_vs_baseline),
+    aes(x = donor, y = mean_tau),
+    inherit.aes = FALSE,
+    shape = 23, size = 2.8, stroke = 0.9, fill = "white", color = "black"
+  ) +
+  scale_fill_manual(values = donor_colors, drop = FALSE) +
+  theme_classic(base_size = 13) +
+  theme(
+    axis.text.x     = element_text(angle = 45, hjust = 1),
+    legend.position = "none"
+  ) +
+  labs(
+    title    = "Full posterior distributions of donor-specific lead effects",
+    subtitle = "Violin = posterior shape; line = 95% CI; open diamond = significant (LFSR < 0.05); closed circle = not significant",
+    x = "Donor", y = "Lead effect (tau_d)"
+  )
+```
+
+The violin plot gives the most complete picture: not just where the estimate is and how wide the uncertainty is, but also the shape of the posterior. Heavy tails, bimodal posteriors, or asymmetric uncertainty are all visible here.
+
+## Compare baseline proliferation and lead sensitivity
+
+Now we can ask: are the donors that are most sensitive to lead also naturally slow growers, or are these independent? A scatter plot of `beta` vs `tau_d` answers this directly.
+
+```{r beta-vs-tau, fig.height=5}
+beta_summary %>%
+  mutate(donor = as.character(donor)) %>%
+  left_join(
+    tau_summary %>% mutate(donor = as.character(donor)) %>% select(donor, mean_tau, sig_vs_baseline),
+    by = "donor"
+  ) %>%
+  mutate(
+    highlight = case_when(
+      donor %in% featured_donors ~ donor,
+      TRUE                       ~ NA_character_
+    )
+  ) %>%
+  ggplot(aes(x = mean_beta, y = mean_tau)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey70") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey70") +
+  geom_point(aes(color = sig_vs_baseline), size = 2.5) +
+  scale_color_manual(
+    values = c(`TRUE` = "#B2182B", `FALSE` = "grey50"),
+    labels = c(`TRUE` = "Significant lead effect (LFSR < 0.05)", `FALSE` = "Not significant"),
+    name   = ""
+  ) +
+  ggrepel::geom_text_repel(aes(label = highlight), size = 3, max.overlaps = 20, na.rm = TRUE) +
+  theme_classic(base_size = 13) +
+  theme(legend.position = "top") +
+  labs(
+    title    = "Baseline proliferation vs lead sensitivity",
+    subtitle = "No strong correlation would suggest these are independent biological properties",
+    x        = "Baseline proliferation effect (beta, relative to CHB11)",
+    y        = "Lead sensitivity (tau_d, relative to CHB11)"
+  )
+```
+
+If these two parameters were correlated, it would suggest that fast-growing donors are systematically more resistant to lead — which would be a biologically interesting finding in itself. If they are uncorrelated, it means lead sensitivity is an independent property, not just a reflection of intrinsic growth rate.
+
+Finally, let's save these values for downstream data analysis.
+
+```{r save-townlet-results}
+townlet_results <- beta_summary %>%
+  rename(mean_beta = mean_beta, lower95_beta = lower95, upper95_beta = upper95) %>%
+  mutate(donor = as.character(donor)) %>%
+  left_join(
+    tau_summary %>%
+      mutate(donor = as.character(donor)) %>%
+      rename(mean_tau = mean_tau, lower95_tau = lower95, upper95_tau = upper95),
+    by = "donor"
+  ) %>%
+  select(donor, mean_beta, lower95_beta, upper95_beta,
+         mean_tau, lower95_tau, upper95_tau, lfsr, sig_vs_baseline)
+
+write_csv(townlet_results, "townlet_donor_estimates.csv")
+```
+
+------------------------------------------------------------------------
+
+# Part 12: The local false sign rate (LFSR)
+
+## What LFSR is and why it differs from a p-value
+
+> **LFSR in plain language**
+>
+> A p-value asks: "If the true effect were zero, how often would I see data as extreme as this?"
+>
+> LFSR asks something different: "Given the data, what is the probability that I have the **wrong sign** for this effect?"
+>
+> If the posterior for a donor's `tau_d` puts 95% of its mass above zero and 5% below, then the LFSR is approximately 0.05. There is a 5% chance that this donor is actually in the opposite direction from what the model estimates.
+>
+> LFSR is especially appropriate for compositional data because the central question is often not whether an effect exists but **whether a donor is resistant or a sensitive**. Getting the direction wrong is the key biological error we want to avoid.
+>
+> LFSR \< 0.05 is the recommended threshold in the Townlet paper.
+
+## Geometric interpretation: LFSR is the tail mass on the wrong side
+
+```{r lfsr-geometry, fig.width=10, fig.height=5}
+set.seed(42)
+
+example_posteriors <- list(
+  "Strong positive effect\n(LFSR ≈ 0.001)" = rnorm(4000, mean = 0.5, sd = 0.12),
+  "Modest positive effect\n(LFSR ≈ 0.06)" = rnorm(4000, mean = 0.18, sd = 0.12),
+  "Uncertain effect\n(LFSR ≈ 0.35)"       = rnorm(4000, mean = 0.07, sd = 0.20)
+)
+
+lfsr_demo_df <- map_dfr(names(example_posteriors), function(nm) {
+  vals <- example_posteriors[[nm]]
+  lfsr <- min(mean(vals < 0), mean(vals > 0))
+  tibble(tau = vals, label = nm, lfsr_val = lfsr)
+})
+
+ggplot(lfsr_demo_df, aes(x = tau)) +
+  geom_histogram(
+    aes(fill = tau < 0), bins = 60,
+    color = "white", linewidth = 0.15
+  ) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "black", linewidth = 0.9) +
+  scale_fill_manual(
+    values = c(`FALSE` = "steelblue", `TRUE` = "firebrick"),
+    labels = c(`FALSE` = "Correct sign", `TRUE` = "Wrong sign"),
+    name = ""
+  ) +
+  facet_wrap(~label, ncol = 3) +
+  theme_classic(base_size = 12) +
+  labs(
+    title    = "Simulated LFSR = fraction of posterior draws on the 'wrong' side of zero",
+    subtitle = "Red = mass that would support the wrong directional conclusion",
+    x = "tau_d (lead effect)", y = "Count of posterior draws"
+  )
+```
+
+The red portion of each histogram is what LFSR is measuring. When almost all the posterior mass is on one side of zero, LFSR is small and we are confident about the direction of the effect.
+
+## LFSR in your actual data
+
+The simulated histograms above illustrated the concept. Now let's look at the same thing using the six donors we have been following throughout the worksheet.
+
+Recall that for a **sensitive** donor, the expected effect is negative — lead hurts them and they lose village share. The "wrong sign" for these donors is a positive `tau_d`. For a **resistant** donor the logic flips: the expected effect is positive, and the wrong sign is negative.
+
+The red portion of each histogram is literally what LFSR is counting — the fraction of posterior draws that would lead you to the wrong directional conclusion about that donor. A small red fraction means the model is confident about the direction of the effect, regardless of how large or small that effect is.
+
+Look across the six panels and ask: which donors have the smallest red fractions? Which have the most? Does the amount of red correspond to what you saw in the violin plot — wide uncertain posteriors versus narrow confident ones?
+
+```{r lfsr-geometry-realdata, fig.width=10, fig.height=5}
+tau_long %>%
+  filter(donor %in% featured_donors) %>%
+  mutate(
+    donor = factor(donor, levels = featured_donors),
+    donor_group = case_when(
+      donor %in% sensitive_donors ~ "Lead-sensitive",
+      donor %in% resistant_donors ~ "Lead-resistant"
+    ),
+    wrong_sign = case_when(
+      donor %in% sensitive_donors ~ tau_d > 0,  # sensitive = negative effect; wrong sign is positive
+      donor %in% resistant_donors ~ tau_d < 0   # resistant = positive effect; wrong sign is negative
+    )
+  ) %>%
+  ggplot(aes(x = tau_d, fill = wrong_sign)) +
+  geom_histogram(bins = 60, color = "white", linewidth = 0.15) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "black", linewidth = 0.8) +
+  scale_fill_manual(
+    values = c(`FALSE` = "steelblue", `TRUE` = "firebrick"),
+    labels = c(`FALSE` = "Correct sign", `TRUE` = "Wrong sign"),
+    name   = ""
+  ) +
+  facet_wrap(~donor, ncol = 3) +
+  theme_classic(base_size = 12) +
+  theme(legend.position = "top") +
+  labs(
+    title    = "LFSR illustrated with real donor posteriors",
+    subtitle = "Red = posterior mass on the wrong side of zero | Top row: sensitive donors | Bottom row: resistant donors",
+    x        = "tau_d (lead effect relative to CHB11)",
+    y        = "Count of posterior draws"
+  )
+```
+
+**UM14-1** is the clearest sensitive donor — the entire posterior is well to the left of zero, essentially no red at all. Very confident.
+
+**Genea42** is the most interesting panel — there's a substantial red fraction, meaning this donor is labeled sensitive but the model has real uncertainty about its direction. This is a great example of why LFSR matters: the posterior mean is negative but you wouldn't want to bet heavily on it.
+
+**Genea47** sits in between — mostly left of zero but with a small red tail, reflecting moderate confidence.
+
+On the resistant side, **WA09, ESI049, and UCSF4** all show clean posteriors well to the right of zero with essentially no red — these are the donors the model is most confident about.
+
+## LFSR versus effect size in the actual data
+
+```{r lfsr-vs-effect}
+ggplot(tau_summary, aes(x = mean_tau, y = lfsr, label = donor)) +
+  geom_hline(yintercept = 0.05, linetype = "dashed", color = "firebrick", linewidth = 0.9) +
+  annotate("text", x = min(tau_summary$mean_tau) * 0.95, y = 0.06,
+           label = "LFSR = 0.05 threshold", color = "firebrick", hjust = 0, size = 3.5) +
+  geom_point(aes(color = sig_vs_baseline), size = 2.5) +
+  scale_color_manual(
+    values = c(`TRUE` = "#B2182B", `FALSE` = "grey50"),
+    labels = c(`TRUE` = "Significant (LFSR < 0.05)", `FALSE` = "Not significant"),
+    name = ""
+  ) +
+  ggrepel::geom_text_repel(size = 3, max.overlaps = 20) +
+  theme_classic(base_size = 14) +
+  labs(
+    title    = "Effect size versus LFSR for each donor",
+    subtitle = "Large effects generally have low LFSR, but not always",
+    x = "Posterior mean tau_d (lead effect)", y = "LFSR"
+  )
+```
+
+Notice that effect size and LFSR are correlated but not identical. A donor with a large estimated effect but high uncertainty (wide posterior) can still have an elevated LFSR. This is the value of having a full posterior rather than just a point estimate.
+
+------------------------------------------------------------------------
+
+# Part 13: Compare naive summaries with Townlet estimates
+
+Naive summaries and Townlet agree on the clearest cases. The disagreements are the interesting ones — they reveal where the model's additional structure matters.
+
+```{r compare-naive-townlet}
+comparison_treatment <- sort(unique(pb_data$treatment_lead))[2]  # first non-zero dose
+
+rank_comparison <- naive_growth %>%
+  filter(treatment_lead == comparison_treatment) %>%
+  select(donor, naive_log2_growth) %>%
+  mutate(donor = as.character(donor)) %>%
+  left_join(tau_summary %>% mutate(donor = as.character(donor)), by = "donor") %>%
+  mutate(
+    naive_rank   = rank(naive_log2_growth),
+    townlet_rank = rank(mean_tau),
+    rank_diff    = abs(naive_rank - townlet_rank),
+    label_donor  = case_when(
+      donor %in% featured_donors             ~ donor,
+      rank_diff > quantile(rank_diff, 0.85)  ~ donor,
+      TRUE                                   ~ NA_character_
+    )
+  )
+ggplot(rank_comparison, aes(x = naive_rank, y = townlet_rank)) +
+  annotate(
+    "text", x = 5, y = 30,
+    label = "Townlet ranks higher\nthan naive",
+    color = "grey40", size = 3.5, fontface = "italic", hjust = 0
+  ) +
+  annotate(
+    "text", x = 22, y = 5,
+    label = "Naive ranks higher\nthan Townlet",
+    color = "grey40", size = 3.5, fontface = "italic", hjust = 0
+  ) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "grey60") +
+  geom_point(aes(color = sig_vs_baseline), size = 2.5) +
+  scale_color_manual(
+    values = c(`TRUE` = "#B2182B", `FALSE` = "grey50"),
+    labels = c(`TRUE` = "Significant (LFSR < 0.05)", `FALSE` = "Not significant"),
+    name   = ""
+  ) +
+  ggrepel::geom_text_repel(
+    aes(label = label_donor),
+    size         = 3,
+    max.overlaps = 20,
+    na.rm        = TRUE
+  ) +
+  theme_classic(base_size = 13) +
+  theme(legend.position = "top") +
+  labs(
+    title    = "Naive versus Townlet: rank comparison",
+    subtitle = paste("Lead treatment:", comparison_treatment, "µM | Dashed line = perfect agreement | Featured donors and largest disagreements labeled"),
+    x        = "Naive rank (centered log2 change)",
+    y        = "Townlet rank (posterior mean tau_d)"
+  )
+```
+
+## **What the rank comparison tells us**
+
+The overall correlation is reassuring — the naive method and Townlet largely agree on which donors are the clearest growers and decliners. That's expected: when an effect is large and consistent across replicates, even a simple first-to-last ratio picks it up. The naive approach is not wrong so much as it is incomplete.
+
+The interesting donors are the ones far from the diagonal.
+
+**UM77-2** is the most striking case. The naive summary ranks it near the bottom — it looks like a decliner under 3 µM lead. Townlet puts it near the top and calls it significantly resistant. This is likely a case of compositional distortion: if one or two dominant donors grew strongly in the same samples where UM77-2 was measured, UM77-2's representation would drop even if its cells were perfectly healthy. The naive ratio captures that relative decline and misreads it as lead sensitivity. Townlet, modeling all donors jointly across all timepoints, can disentangle this.
+
+**WA24 and UCLA2** show a similar but less extreme pattern — the naive method ranks them as moderate decliners while Townlet is more neutral. These are likely cases where hierarchical shrinkage pulled uncertain estimates back toward the center.
+
+**The lower-right cluster** — donors with high naive ranks but lower Townlet ranks — represents the opposite problem: donors the naive method was overly optimistic about. Townlet tempered these estimates, again likely through a combination of using all timepoints and regularizing noisy donors toward the group mean.
+
+The core lesson is this: the naive method has no way to separate a donor's true biological response to lead from the background noise of compositional shifts, replicate variation, and uneven sampling across timepoints. Townlet separates these sources of variation explicitly, which is why the two methods agree on the obvious cases and disagree most on the ambiguous ones — and the ambiguous ones are exactly where getting it right matters most.
+
+------------------------------------------------------------------------
+
+# Part 14: Connect model outputs back to raw data
+
+## Select donors with extreme effects
+
+```{r choose-interesting-donors}
+interesting_donors <- tau_summary %>%
+  slice(c(1, 2, n() - 1, n())) %>%
+  pull(donor) %>%
+  as.character()
+
+interesting_donors
+```
+
+## Raw trajectories for selected donors
+
+```{r interesting-raw-trajectories}
+interesting_donors <- c("UM14-1", "ESI049", "UCSF4", "UM77-2")
+
+pb_plot_traj %>%
+  filter(donor %in% interesting_donors) %>%
+  mutate(
+    donor = factor(donor, levels = interesting_donors),
+    treatment_lead = factor(
+      treatment_lead,
+      levels = c(0, 3, 10),
+      labels = c("0 µM Pb²⁺", "3 µM Pb²⁺", "10 µM Pb²⁺")
+    )
+  ) %>%
+  ggplot(aes(
+    x     = time,
+    y     = representation,
+    color = donor,
+    group = interaction(donor, replicate)
+  )) +
+  geom_line(alpha = 0.75) +
+  geom_point(size = 1.8) +
+  facet_wrap(~treatment_lead, scales = "free_x") +
+  scale_color_manual(values = donor_colors, drop = FALSE) +
+  scale_x_continuous(breaks = c(0, 6, 9)) +
+  theme_classic(base_size = 13) +
+  theme(legend.position = "right") +
+  labs(
+    title    = "Raw trajectories for donors with extreme and discordant model-estimated effects",
+    subtitle = "UM14-1 = sensitive | ESI049, UCSF4 = resistant | UM77-2 = naive/Townlet disagreement",
+    x        = "Day",
+    y        = "Representation",
+    color    = "Donor"
+  )
+```
+
+## Posteriors for the same donors
+
+```{r interesting-posteriors}
+tau_long %>%
+  filter(as.character(donor) %in% interesting_donors) %>%
+  mutate(donor = factor(as.character(donor), levels = interesting_donors)) %>%
+  ggplot(aes(x = tau_d, fill = donor)) +
+  geom_density(alpha = 0.7, color = "grey30") +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  scale_fill_manual(values = donor_colors, drop = FALSE) +
+  facet_wrap(~donor, ncol = 2) +
+  theme_classic(base_size = 12) +
+  theme(legend.position = "none") +
+  labs(
+    title    = "Posterior tau_d distributions for selected donors",
+    subtitle = "UM77-2: naive ranked as sensitive; Townlet ranked as resistant",
+    x        = "tau_d (lead effect relative to CHB11)",
+    y        = "Density"
+  )
+```
+
+Looking at these two plots together is the best way to build intuition for what the model is doing. Ask: does the visual pattern in the raw trajectories match the story the posterior is telling? Where does the model seem appropriately confident? Where does replicate-to-replicate noise make you less certain about the posterior conclusion?
+
+------------------------------------------------------------------------
+
+# Part 15: Model diagnostics
+
+## Check for convergence
+
+**What is a chain?** One chain is a single complete sampling run: Stan starts from a randomly chosen point in parameter space and takes thousands of steps, recording the parameter values at each step. The sequence of recorded values is the chain.
+
+**Why run multiple chains?** To verify that the sampler is not trapped in one region of the posterior. If you start four chains from four very different random initial values and they all end up sampling the same distribution, that is strong evidence the sampler found the true posterior. If the chains look different from each other — different means, different spreads — the model has not converged and the draws cannot be trusted.
+
+**What does convergence look like?** After an initial warmup phase (which Stan discards), all chains should be mixing in the same band of parameter values. The trace plot below simulates this for one hypothetical parameter across 4 chains: wide exploration during warmup, then all four settling into the same region.
+
+```{r chains-trace, cache=TRUE, fig.width=10, fig.height=4}
+set.seed(99)
+
+chains_df <- map_dfr(1:4, function(chain_id) {
+  # Each chain starts from a different random value
+  start     <- runif(1, -2, 2)
+  warmup    <- cumsum(c(start, rnorm(99, mean = (0.3 - start) / 100, sd = 0.3)))
+  post_samp <- rnorm(200, mean = 0.3, sd = 0.18)
+  tibble(
+    iteration = seq_along(c(warmup, post_samp)),
+    value     = c(warmup, post_samp),
+    chain     = paste("Chain", chain_id)
+  )
+})
+
+ggplot(chains_df, aes(x = iteration, y = value, color = chain)) +
+  geom_line(alpha = 0.7, linewidth = 0.5) +
+  geom_vline(xintercept = 100, linetype = "dashed", color = "black", linewidth = 0.9) +
+  annotate("rect", xmin = 0,   xmax = 100, ymin = -Inf, ymax = Inf,
+           fill = "grey90", alpha = 0.4) +
+  annotate("text", x = 50,  y = max(chains_df$value) * 0.92,
+           label = "Warmup\n(discarded)", hjust = 0.5, size = 3.5, color = "grey30") +
+  annotate("text", x = 200, y = max(chains_df$value) * 0.92,
+           label = "Sampling\n(kept as draws)", hjust = 0.5, size = 3.5, color = "grey30") +
+  scale_color_brewer(palette = "Set1", name = "") +
+  theme_classic(base_size = 13) +
+  theme(legend.position = "top") +
+  labs(
+    title    = "Four independent chains sampling the same posterior (simulated)",
+    subtitle = "Each chain starts from a different random value; after warmup all four converge to the same band",
+    x = "Iteration", y = "Sampled value (one parameter)"
+  )
+```
+
+**What R̂ quantifies:** It compares the variance *between* chains to the variance *within* chains. When all four chains are exploring the same distribution, those two quantities are similar and R̂ ≈ 1. R̂ \>\> 1 means some chains are sampling a different region — a sign the model has not converged and results should not be interpreted. Values near 1.0 (conventionally \< 1.01) indicate convergence.
+
+```{r check-rhat, cache=TRUE}
+fit_summary <- rstan::summary(village$fit)$summary
+
+rhat_vals <- fit_summary[, "Rhat"]
+rhat_vals_clean <- rhat_vals[!is.na(rhat_vals)]
+
+tibble(
+  parameter = names(rhat_vals_clean),
+  rhat      = rhat_vals_clean
+) %>%
+  filter(!str_detect(parameter, "^lp__")) %>%
+  ggplot(aes(x = rhat)) +
+  geom_histogram(bins = 40, fill = "steelblue", color = "white") +
+  geom_vline(xintercept = 1.01, linetype = "dashed", color = "firebrick") +
+  theme_classic(base_size = 13) +
+  labs(
+    title    = "R̂ values across all model parameters",
+    subtitle = "Values near 1.0 indicate convergence; values above ~1.01 warrant investigation",
+    x = "R̂", y = "Count"
+  )
+```
+
+```{r flag-high-rhat}
+tibble(parameter = names(rhat_vals_clean), rhat = rhat_vals_clean) %>%
+  filter(rhat > 1.05) %>%
+  arrange(desc(rhat))
+```
+
+If this table is empty, all parameters converged well. If some parameters have R̂ \> 1.05, note which ones and consider whether they correspond to donors with very sparse data.
+
+## Effective sample size
+
+The effective sample size (n_eff) accounts for autocorrelation in the chains. A very low n_eff relative to the total number of draws means the chains mixed slowly and the posterior is not well characterized.
+
+```{r check-neff, cache=TRUE}
+neff_vals <- fit_summary[, "n_eff"]
+neff_clean <- neff_vals[!is.na(neff_vals)]
+
+tibble(
+  parameter = names(neff_clean),
+  n_eff     = neff_clean
+) %>%
+  filter(!str_detect(parameter, "^lp__")) %>%
+  ggplot(aes(x = n_eff)) +
+  geom_histogram(bins = 40, fill = "steelblue", color = "white") +
+  theme_classic(base_size = 13) +
+  labs(
+    title    = "Effective sample sizes across model parameters",
+    subtitle = "Low n_eff (< ~100) may indicate sampling difficulty",
+    x = "Effective sample size (n_eff)", y = "Count"
+  )
+```
+
+------------------------------------------------------------------------
+
+# Part 16: Optional interactive plot
+
+This section uses `plotly` for interactive exploration and is optional — useful if you want to hover over data points while you explore the data.
+
+```{r interactive-plot, eval=FALSE}
+library(plotly)
+
+p_interactive <- pb_summary_plot %>%
+  filter(donor %in% example_donors) %>%
+  mutate(
+    donor = factor(donor, levels = names(donor_colors)),
+    treatment_label = factor(
+      treatment_lead,
+      levels = c(0, 3, 10),
+      labels = c("0 µM Pb²⁺", "3 µM Pb²⁺", "10 µM Pb²⁺")
+    )
+  ) %>%
+  ggplot(aes(
+    x = time, y = mean_representation, color = donor, group = donor,
+    text = paste("Donor:", donor, "<br>Time:", time,
+                 "<br>Treatment:", treatment_label,
+                 "<br>Mean representation:", round(mean_representation, 4))
+  )) +
+  geom_line() +
+  geom_point() +
+  facet_wrap(~treatment_label) +
+  scale_color_manual(values = donor_colors, drop = FALSE) +
+  theme_classic(base_size = 13)
+
+plotly::ggplotly(p_interactive, tooltip = "text")
+```
+
+------------------------------------------------------------------------
+
+# Part 17: Reproducibility and reporting
+
+When reporting a Townlet analysis, include:
+
+-   What dataset was analyzed and what conditions were included.
+-   Which donors were excluded and why.
+-   The Townlet model formula (`model = "~treatment_lead"`).
+-   Whether normalization was applied after exclusions (`normalize = TRUE`).
+-   The baseline donor used for effect estimation.
+-   Which parameter was the primary outcome (`tau_d` for treatment effects, `beta` for baseline proliferation).
+-   The LFSR threshold used for significance calls.
+-   R̂ range and any convergence concerns.
+
+```{r session-info}
+sessionInfo()
+```
+
+------------------------------------------------------------------------
+
+# Summary and conceptual review
+
+**1. What is compositional data, and why does it matter?** Village data are compositions: vectors of donor proportions that must sum to 1. This constraint means donors are not independent and naive methods can generate spurious signals.
+
+**2. Why are naive growth summaries insufficient?** They use only two timepoints, have no uncertainty quantification, cannot separate treatment effects from baseline growth, and inherit compositional distortion without correcting for it.
+
+**3. What does a Dirichlet model do?** It models compositions directly on the simplex, respecting both non-negativity and the unit-sum constraint. Townlet parameterizes the Dirichlet concentration parameters as a function of time, treatment, and donor identity.
+
+**4. What is a posterior distribution and what do draws represent?** A posterior distribution is the full range of parameter values consistent with the data, weighted by their probability. Draws are samples from that distribution; they allow you to compute any summary you want (means, quantiles, tail probabilities) without additional assumptions.
+
+**5. What is the difference between `beta` and `tau_d`?** `beta` is the donor-specific baseline proliferation effect — how fast a donor grows relative to CHB11 in control conditions. `tau_d` is the donor-specific treatment slope — how much that donor's growth changes per unit of lead concentration. They are estimated jointly but are independent: a fast baseline grower is not necessarily lead-resistant, and a slow grower is not necessarily lead-sensitive.
+
+**6. What does LFSR measure and how do you use it?** LFSR (local false sign rate) is the posterior probability of having the wrong directional conclusion about a donor effect. LFSR \< 0.05 means there is less than 5% chance the true effect is in the opposite direction from the estimate. It is preferred over a p-value here because the biological question is about direction of effect, not simply whether an effect exists.
